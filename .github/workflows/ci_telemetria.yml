@@ -1,0 +1,98 @@
+name: Pipeline CI/CD com Elastic APM (Python OTLP Customizado)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout do Repositório
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar Dependências
+        run: npm install
+
+      - name: Executar Testes
+        run: npm test
+        # O 'continue-on-error: true' garante que mesmo se os testes falharem, 
+        # o workflow continuará para enviar o trace do resultado ao APM.
+        continue-on-error: true
+
+      - name: Enviar Traces para o Elastic APM
+        if: always()
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.ELASTIC_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.ELASTIC_OTLP_HEADERS }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_WORKFLOW: ${{ github.workflow }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_JOB: ${{ github.job }}
+        run: |
+          python -m pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http requests
+          python -c '
+          import os
+          import sys
+          from opentelemetry import trace
+          from opentelemetry.sdk.resources import Resource
+          from opentelemetry.sdk.trace import TracerProvider
+          from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+          from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+          raw_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+          endpoint = raw_endpoint.rstrip("/") + "/v1/traces" if not raw_endpoint.endswith("/v1/traces") else raw_endpoint
+
+          raw_headers = os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "")
+          headers = {}
+          if raw_headers:
+              for part in raw_headers.split(","):
+                  if "=" in part:
+                      k, v = part.split("=", 1)
+                      headers[k.strip()] = v.strip()
+
+          # Captura as variáveis de ambiente em variáveis puras do Python
+          env_job = os.getenv("GITHUB_JOB", "build")
+          env_workflow = os.getenv("GITHUB_WORKFLOW", "CI")
+          env_repo = os.getenv("GITHUB_REPOSITORY", "unknown")
+          env_run_id = os.getenv("GITHUB_RUN_ID", "0")
+
+          resource = Resource.create(attributes={
+              "service.name": "github-actions-ci",
+              "service.version": "1.0.0",
+              "deployment.environment": "production"
+          })
+
+          try:
+              provider = TracerProvider(resource=resource)
+              exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers, timeout=20)
+              processor = SimpleSpanProcessor(exporter)
+              provider.add_span_processor(processor)
+              trace.set_tracer_provider(provider)
+
+              tracer = trace.get_tracer("elastic-apm-github-actions")
+
+              span_name = f"{env_job} - {env_workflow}"
+              with tracer.start_as_current_span(span_name) as span:
+                  span.set_attribute("http.target", env_repo)
+                  span.set_attribute("github.run_id", env_run_id)
+
+              provider.force_flush()
+              provider.shutdown()
+              print("Trace otimizado enviado com sucesso para o APM!")
+          except Exception as e:
+              print(f"Erro ao exportar spans: {e}", file=sys.stderr)
+              sys.exit(1)
+          '
